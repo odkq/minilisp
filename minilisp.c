@@ -34,6 +34,7 @@ enum {
     TFUNCTION,
     TMACRO,
     TENV,
+    TSTRING,
     // The marker that indicates the object has been moved to other location by GC. The new location
     // can be found at the forwarding pointer. Only the functions to do garbage collection set and
     // handle the object of this type. Other functions will never see the object of this type.
@@ -42,7 +43,7 @@ enum {
     TTRUE,
     TNIL,
     TDOT,
-    TCPAREN,
+    TCPAREN
 };
 
 // Typedef for the primitive function
@@ -63,6 +64,8 @@ typedef struct Obj {
     union {
         // Int
         int value;
+	// String. Shares allocation "magic" with name below
+	char string[1];
         // Cell
         struct {
             struct Obj *car;
@@ -94,7 +97,6 @@ static Obj *True = &(Obj){ TTRUE };
 static Obj *Nil = &(Obj){ TNIL };
 static Obj *Dot = &(Obj){ TDOT };
 static Obj *Cparen = &(Obj){ TCPAREN };
-
 // The list containing all symbols. Such data structure is traditionally called the "obarray", but I
 // avoid using it as a variable name as this is not an array but a list.
 static Obj *Symbols;
@@ -292,6 +294,7 @@ static void gc(void *root) {
         switch (scan1->type) {
         case TINT:
         case TSYMBOL:
+	case TSTRING:
         case TPRIMITIVE:
             // Any of the above types does not contain a pointer to a GC-managed object.
             break;
@@ -347,6 +350,12 @@ static Obj *make_symbol(void *root, char *name) {
     return sym;
 }
 
+static Obj *make_string(void *root, char *string) {
+    Obj *sym = alloc(root, TSTRING, strlen(string) + 1);
+    strcpy(sym->string, string);
+    return sym;
+}
+
 static Obj *make_primitive(void *root, Primitive *fn) {
     Obj *r = alloc(root, TPRIMITIVE, sizeof(Primitive *));
     r->fn = fn;
@@ -383,6 +392,7 @@ static Obj *acons(void *root, Obj **x, Obj **y, Obj **a) {
 //======================================================================
 
 #define SYMBOL_MAX_LEN 200
+#define STRING_MAX_LEN 200
 const char symbol_chars[] = "~!@#$%^&*-_=+:/?<>";
 
 static Obj *read_expr(void *root);
@@ -469,6 +479,19 @@ static int read_number(int val) {
     return val;
 }
 
+static Obj *read_string(void *root) {
+    char buf[STRING_MAX_LEN + 1];
+    int len = 0;
+    int c;
+    while ((c = getchar()) != '"') {
+        if (STRING_MAX_LEN <= len)
+            error("String constant too long");
+        buf[len++] = c;
+    }
+    buf[len] = '\0';
+    return make_string(root, buf);
+}
+
 static Obj *read_symbol(void *root, char c) {
     char buf[SYMBOL_MAX_LEN + 1];
     buf[0] = c;
@@ -501,6 +524,8 @@ static Obj *read_expr(void *root) {
             return Dot;
         if (c == '\'')
             return read_quote(root);
+        if (c == '"')
+            return read_string(root);
         if (isdigit(c))
             return make_int(root, read_number(c - '0'));
         if (c == '-' && isdigit(peek()))
@@ -537,6 +562,7 @@ static void print(Obj *obj) {
         return
     CASE(TINT, "%d", obj->value);
     CASE(TSYMBOL, "%s", obj->name);
+    CASE(TSTRING, "\"%s\"", obj->string);
     CASE(TPRIMITIVE, "<primitive>");
     CASE(TFUNCTION, "<function>");
     CASE(TMACRO, "<macro>");
@@ -664,6 +690,7 @@ static Obj *macroexpand(void *root, Obj **env, Obj **obj) {
 static Obj *eval(void *root, Obj **env, Obj **obj) {
     switch ((*obj)->type) {
     case TINT:
+    case TSTRING:
     case TPRIMITIVE:
     case TFUNCTION:
     case TTRUE:
@@ -774,6 +801,129 @@ static Obj *prim_gensym(void *root, Obj **env, Obj **list) {
   char buf[10];
   snprintf(buf, sizeof(buf), "G__%d", count++);
   return make_symbol(root, buf);
+}
+
+// (string-append <string> ...)
+static Obj *prim_string_append(void *root, Obj **env, Obj **list) {
+    char buf[STRING_MAX_LEN + 1];
+    size_t len = 0;
+    char *p = buf;
+    buf[0] = '\0';
+
+    /* Check all the types on the list first. If there is at least one string
+     * perform string arithmetic */
+    for (Obj *args = eval_list(root, env, list); args != Nil; args = args->cdr) {
+        if (args->car->type != TSTRING)
+            error("string-append takes only strings");
+        if (strlen(args->car->string) + len > STRING_MAX_LEN)
+            error("String overflow");
+        strcat(p, args->car->string);
+        len += strlen(args->car->string);
+    }
+
+    return make_string(root, buf);
+}
+
+// (number->string <number>)
+static Obj *prim_number_to_string(void *root, Obj **env, Obj **list) {
+    char buf[STRING_MAX_LEN + 1];
+
+    Obj *args = eval_list(root, env, list);
+    if (length(args) != 1)
+        error("malformed number->string");
+    Obj *number = args->car;
+    if (number->type != TINT)
+        error("number->string takes only numbers");
+    sprintf(buf, "%d", number->value);
+    return make_string(root, buf);
+}
+
+// (number->byte <number>)
+static Obj *prim_number_to_byte(void *root, Obj **env, Obj **list) {
+    char buf[2];
+
+    Obj *args = eval_list(root, env, list);
+    if (length(args) != 1)
+        error("malformed number->string");
+    Obj *number = args->car;
+    if (number->type != TINT)
+        error("number->byte takes only numbers");
+    if (number->value > 255)
+        error("number->byte only accepts ints up to 255");
+    if (number->value < 0)
+        error("number->byte only accept positive integers");
+    sprintf(buf, "%c", (char)number->value);
+    return make_string(root, buf);
+}
+
+// (string->number <string>)
+static Obj *prim_string_to_number(void *root, Obj **env, Obj **list) {
+    int n;
+
+    Obj *args = eval_list(root, env, list);
+    if (length(args) != 1)
+        error("malformed string->number");
+    Obj *string = args->car;
+    if (string->type != TSTRING)
+        error("string->number takes only strings");
+    n = atoi(string->string);
+    return make_int(root, n);
+}
+
+// (substring <string> <start> <end>)
+static Obj *prim_substring(void *root, Obj **env, Obj **list) {
+    char buf[STRING_MAX_LEN + 1];
+    size_t start, end, i;
+    char *p;
+    Obj *string, *ostart, *oend;
+
+    Obj *args = eval_list(root, env, list);
+
+    if ((length(args) < 2) || (length(args) > 3))
+        error("wrong number of parameters for substring");
+
+    string = args->car;
+    ostart = args->cdr->car;
+    if (length(args) == 2) {
+        end = strlen(string->string);
+    } else {
+        oend = args->cdr->cdr->car;
+        if (oend->type != TINT) {
+            error("substring signature mismatch");
+        } else {
+            end = (size_t)oend->value;
+        }
+    }
+
+    if ((string->type != TSTRING) || (ostart->type != TINT)) {
+        error("substring signature mismatch");
+    }
+    start = (size_t)ostart->value;
+    if (start > end) {
+        error("start > end");
+    } else if (start < 0) {
+        error("start < 0");
+    } else if (end > strlen(string->string)) {
+        error("end overflow");
+    }
+
+    for (p = buf, i = start; i < end; i++) {
+        *p++ = string->string[i];
+    }
+    *p = '\0';
+    return make_string(root, buf);
+}
+
+// (string-length <string>)
+static Obj *prim_string_length(void *root, Obj **env, Obj **list) {
+    Obj *args = eval_list(root, env, list);
+
+    if ((length(args) < 1))
+        error("wrong number of parameters for string-length");
+    if (args->car->type != TSTRING)
+        error("string-length only accept strings");
+    return make_int(root, (int)strlen(args->car->string));
+
 }
 
 // (+ <integer> ...)
@@ -953,6 +1103,12 @@ static void define_primitives(void *root, Obj **env) {
     add_primitive(root, env, "=", prim_num_eq);
     add_primitive(root, env, "eq", prim_eq);
     add_primitive(root, env, "println", prim_println);
+    add_primitive(root, env, "string-append", prim_string_append);
+    add_primitive(root, env, "number->string", prim_number_to_string);
+    add_primitive(root, env, "string->number", prim_string_to_number);
+    add_primitive(root, env, "number->byte", prim_number_to_byte);
+    add_primitive(root, env, "substring", prim_substring);
+    add_primitive(root, env, "string-length", prim_string_length);
 }
 
 //======================================================================
