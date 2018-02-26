@@ -395,11 +395,41 @@ static Obj *acons(void *root, Obj **x, Obj **y, Obj **a) {
 #define STRING_MAX_LEN 200
 const char symbol_chars[] = "~!@#$%^&*-_=+:/?<>";
 
+/* Use a global variable for the current buffer */
+char *current_buffer = NULL;
+size_t current_index = 0;
+
+static int buffer_getchar()
+{
+    int r;
+
+    if (current_buffer == NULL) {
+        return getchar();
+    }
+    if (current_buffer[current_index] == '\0') {
+        r = EOF;
+    } else {
+        r = (int)current_buffer[current_index];
+    }
+    current_index += 1;
+    return r;
+}
+
+static int buffer_ungetc(int c, FILE *stream)
+{
+    if (current_buffer == NULL) {
+        return ungetc(c, stream);
+    }
+    if (current_index > 0)
+        current_index -= 1;
+    return c;
+}
+
 static Obj *read_expr(void *root);
 
 static int peek(void) {
-    int c = getchar();
-    ungetc(c, stdin);
+    int c = buffer_getchar();
+    buffer_ungetc(c, stdin);
     return c;
 }
 
@@ -418,12 +448,12 @@ static Obj *reverse(Obj *p) {
 // Skips the input until newline is found. Newline is one of \r, \r\n or \n.
 static void skip_line(void) {
     for (;;) {
-        int c = getchar();
+        int c = buffer_getchar();
         if (c == EOF || c == '\n')
             return;
         if (c == '\r') {
             if (peek() == '\n')
-                getchar();
+                buffer_getchar();
             return;
         }
     }
@@ -475,7 +505,7 @@ static Obj *read_quote(void *root) {
 
 static int read_number(int val) {
     while (isdigit(peek()))
-        val = val * 10 + (getchar() - '0');
+        val = val * 10 + (buffer_getchar() - '0');
     return val;
 }
 
@@ -483,7 +513,7 @@ static Obj *read_string(void *root) {
     char buf[STRING_MAX_LEN + 1];
     int len = 0;
     int c;
-    while ((c = getchar()) != '"') {
+    while ((c = buffer_getchar()) != '"') {
         if (STRING_MAX_LEN <= len)
             error("String constant too long");
         buf[len++] = c;
@@ -499,7 +529,7 @@ static Obj *read_symbol(void *root, char c) {
     while (isalnum(peek()) || strchr(symbol_chars, peek())) {
         if (SYMBOL_MAX_LEN <= len)
             error("Symbol name too long");
-        buf[len++] = getchar();
+        buf[len++] = buffer_getchar();
     }
     buf[len] = '\0';
     return intern(root, buf);
@@ -507,7 +537,7 @@ static Obj *read_symbol(void *root, char c) {
 
 static Obj *read_expr(void *root) {
     for (;;) {
-        int c = getchar();
+        int c = buffer_getchar();
         if (c == ' ' || c == '\n' || c == '\r' || c == '\t')
             continue;
         if (c == EOF)
@@ -870,10 +900,92 @@ static Obj *prim_string_to_number(void *root, Obj **env, Obj **list) {
     return make_int(root, n);
 }
 
-// (substring <string> <start> <end>)
-static Obj *prim_substring(void *root, Obj **env, Obj **list) {
+// (string-length <string>); returns the length _in bytes_ of a string
+static Obj *prim_string_length(void *root, Obj **env, Obj **list) {
+    Obj *args = eval_list(root, env, list);
+
+    if ((length(args) < 1))
+        error("wrong number of parameters for string-length");
+    if (args->car->type != TSTRING)
+        error("string-length only accept strings");
+    return make_int(root, (int)strlen(args->car->string));
+
+}
+
+/*
+ * Return how many bytes has the next utf-8 character pointed
+ * by *s, 0 if '\0' is found or -1 if there is a decoding error
+ * See https://en.wikipedia.org/wiki/UTF-8#Description
+ */
+static int bytes_of_utf8_character(const unsigned char *s)
+{
+    if (*s == (char)0x00) {
+        return 0;
+    } else if ((*s & 0x80) == 0x00) {
+		return 1;	// 1 byte encoding
+	} else if ((*s & 0xe0) == 0xc0) { 	// two byte encoding
+		if ((*(s + 1) & 0xc0) != 0x80) {
+            printf("next char 0x%2.2x\n", *(s + 1));
+			return -1;
+		}
+		return 2;
+	} else if ((*s & 0xf0) == 0xe0) {
+		if ((*(s + 1) & 0xc0) != 0x80) {
+            printf("wrong next char 0x%2.2x\n", (unsigned char) *(s + 1));
+			return -1;
+        }
+        if ((*(s + 2) & 0xc0) != 0x80) {
+            printf("wrong next next char 0x%2.2x\n", (unsigned char) *(s + 2));
+			return -1;
+        }
+		return 3;
+	} else if ((*s & 0xf8) == 0xf0) {
+		if (((*(s + 1) & 0xc0) != 0x80) || ((*(s + 2) & 0xc0) != 0x80) ||
+			((*(s + 3)  & 0xc0) != 0x80)) {
+				return -1;
+		}
+		return 4;
+	} else {
+		return -1;
+	}
+}
+/* return the length in utf-8 characters of the given string, not including
+ * the last '\0' */
+static int utf8len(const char *s)
+{
+	int delta, length = 0;
+
+	while (1) {
+		delta = bytes_of_utf8_character(s);
+        if (delta == 0)
+            return length;
+        else if (delta == -1)
+            return -1;
+        length += 1;
+        s += delta;
+    }
+}
+// (string-length-utf8 <string>) ; returns the length in characters of a
+//                                 string encoded as utf-8
+static Obj *prim_string_length_utf8(void *root, Obj **env, Obj **list) {
+	int len;
+    Obj *args = eval_list(root, env, list);
+
+    if ((length(args) < 1))
+        error("wrong number of parameters for string-length");
+    if (args->car->type != TSTRING)
+        error("string-length only accept strings");
+	len = utf8len(args->car->string);
+	if (len < 0) {
+		return Nil;
+	}
+    return make_int(root, len);
+
+}
+
+static Obj *common_substring(void *root, Obj **env, Obj **list, int bytes) {
     char buf[STRING_MAX_LEN + 1];
-    size_t start, end, i;
+    int start, end, i, j, k, delta;
     char *p;
     Obj *string, *ostart, *oend;
 
@@ -885,45 +997,77 @@ static Obj *prim_substring(void *root, Obj **env, Obj **list) {
     string = args->car;
     ostart = args->cdr->car;
     if (length(args) == 2) {
+        if (bytes) {
+            end = utf8len(string->string);
+            if (end == -1) {
+                error("utf8len returned -1");
+                return Nil;
+            }
+        }
         end = strlen(string->string);
     } else {
         oend = args->cdr->cdr->car;
         if (oend->type != TINT) {
             error("substring signature mismatch");
         } else {
-            end = (size_t)oend->value;
+            end = oend->value;
         }
     }
 
     if ((string->type != TSTRING) || (ostart->type != TINT)) {
         error("substring signature mismatch");
     }
-    start = (size_t)ostart->value;
+    start = ostart->value;
     if (start > end) {
         error("start > end");
     } else if (start < 0) {
         error("start < 0");
-    } else if (end > strlen(string->string)) {
+    } else if (bytes && (end > strlen(string->string))) {
+        error("end overflow");
+    } else if ((!bytes) && (end > utf8len(string->string))) {
         error("end overflow");
     }
 
-    for (p = buf, i = start; i < end; i++) {
-        *p++ = string->string[i];
+    if (bytes) {
+        for (p = buf, i = start; i < end; i++) {
+            *p++ = string->string[i];
+        }
+    } else {
+        p = buf;
+        i = 0;
+        for (j = 0; j < start; j++) {
+            delta = bytes_of_utf8_character(&(string->string[i]));
+            if (delta <= 0)
+                return Nil;
+            i += delta;
+        }
+        for (k = 0; k < (end - start); k++) {
+            delta = bytes_of_utf8_character(&(string->string[i]));
+            if (delta == 0) {
+                break;
+            } else if (delta < 0) {
+                error("delta negative");
+                return Nil;
+            }
+            for (j = i; j < i + delta; j++) {
+                *p++ = string->string[j];
+            }
+            i = j;
+        }
     }
     *p = '\0';
     return make_string(root, buf);
 }
 
-// (string-length <string>)
-static Obj *prim_string_length(void *root, Obj **env, Obj **list) {
-    Obj *args = eval_list(root, env, list);
+// (substring <string> <start> <end>);  Return substring using byte indexes
+static Obj *prim_substring(void *root, Obj **env, Obj **list) {
+    return common_substring(root, env, list, 1);
+}
 
-    if ((length(args) < 1))
-        error("wrong number of parameters for string-length");
-    if (args->car->type != TSTRING)
-        error("string-length only accept strings");
-    return make_int(root, (int)strlen(args->car->string));
-
+// (substring-utf8 <string> <start> <end>) ; substring using character
+//                                         ; (utf-8 aware) indexs
+static Obj *prim_substring_utf8(void *root, Obj **env, Obj **list) {
+    return common_substring(root, env, list, 0);
 }
 
 // (+ <integer> ...)
@@ -1108,7 +1252,9 @@ static void define_primitives(void *root, Obj **env) {
     add_primitive(root, env, "string->number", prim_string_to_number);
     add_primitive(root, env, "number->byte", prim_number_to_byte);
     add_primitive(root, env, "substring", prim_substring);
+    add_primitive(root, env, "substring-utf8", prim_substring_utf8);
     add_primitive(root, env, "string-length", prim_string_length);
+    add_primitive(root, env, "string-length-utf8", prim_string_length_utf8);
 }
 
 //======================================================================
@@ -1121,7 +1267,11 @@ static bool getEnvFlag(char *name) {
     return val && val[0];
 }
 
+#ifndef NO_MAIN
 int main(int argc, char **argv) {
+    char testbuf1[] = "(defun hi (s) (string-append \"hello \" s))";
+    char testbuf2[] = "(println (hi \"world\"))";
+
     // Debug flags
     debug_gc = getEnvFlag("MINILISP_DEBUG_GC");
     always_gc = getEnvFlag("MINILISP_ALWAYS_GC");
@@ -1137,16 +1287,30 @@ int main(int argc, char **argv) {
     define_constants(root, env);
     define_primitives(root, env);
 
-    // The main loop
-    for (;;) {
-        *expr = read_expr(root);
-        if (!*expr)
-            return 0;
-        if (*expr == Cparen)
-            error("Stray close parenthesis");
-        if (*expr == Dot)
-            error("Stray dot");
-        print(eval(root, env, expr));
-        printf("\n");
+    char *buffers[] = {testbuf1, testbuf2, NULL};
+    int i;
+    for(i = 0;; i++) {
+        current_buffer = buffers[i];
+        current_index = 0;
+        // The main loop
+        for (;;) {
+            *expr = read_expr(root);
+            if (!*expr)
+                break;
+            if (*expr == Cparen)
+                error("Stray close parenthesis");
+            if (*expr == Dot)
+                error("Stray dot");
+            if (current_buffer == NULL)
+                print(eval(root, env, expr));
+            else
+                eval(root, env, expr);
+        }
+        if (current_buffer == NULL) {
+            printf("cbn\n");
+            break;
+        }
     }
+    return 0;
 }
+#endif
